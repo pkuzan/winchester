@@ -6,14 +6,14 @@
     Pushbutton
     Single LED 
     HW sends MIDI note-on / note-off on ch=16 note=32 to signal audio engine start and stop
-    Sends MIDI program change on ch-16 program=127 to shut computer down
+    Sends MIDI program change on ch-16 program=121 to shut computer down
     Romsey OrganWorks  
     Paul Kuzan
-    12/11/2023
+    01/04/2024
 */
 
-#include <Servo.h>
 #include <MIDIUSB.h>
+#include <Bounce2.h>
 
 #define STATE_STANDBY 1
 #define STATE_COMPUTER_STARTING 2
@@ -29,16 +29,26 @@
 #define STATE_AUDIO_OFF 1
 #define STATE_AUDIO_ON 2
 
+#define SWITCH_NONE 1
+#define SWITCH_PRESS_SHORT 2
+#define SWITCH_PRESS_LONG 3
+
 //Controls servo to start Mac
 const int servoPin = 10;
 
-//Uses USB bus power to detect when Mac has actually started and shutdown
+//TIP120 output - controls GND to drawstops
+const int tip120Pin = 9;
+
+//Uses USB bus power to detect when Computer has actually started and shutdown
 //Logic is inverted by opto-isolator
 const int USBBusPowerPin = 21;
 
-//Console switching power
+//Console switching power from console
 //Logic is inverted by opto-isolator
 const int switchingPowerPin = 15;
+//OR
+//Push button start
+const int pushButtonPin = 18;
 
 //Status LED on board
 const int ledPin = 7;
@@ -51,19 +61,20 @@ const int audioPowerPin = 1;
 //Controls aux peripherals - follows USB bus power
 const int auxPowerPin = 2;
 
-// Push button
-const int pushButtonPin = 18;
+//Controls power to NUC
+const int computerPowerPin = 3;
 
 // Aux Input
 const int auxInPin = 19;
 
-//Shuts down Mac by sending a MIDI Program Change 127 on Channel 16.
+//Shuts down computer by sending a MIDI Program Change 121 on Channel 16.
 const byte midiChannel = 15;
 const byte midiShutdownPC = 120;
 //Receieves MIDI Note on / off to indicate if HW audio engine has started or stopped
 const byte midiAudioEngineStateNote = 32;
 
-Servo servo;
+//Servo servo;
+Bounce pushButton = Bounce();
 
 //Power LED flash  interval
 const unsigned long onFlashInterval = 1000UL;
@@ -79,12 +90,18 @@ volatile byte ledState;
 bool justTransitioned = false;
 bool ledStateJustTransitioned = false;
 
+//Pushbutton hold time
+const unsigned long switchHoldTime = 5000UL;
+unsigned long switchPressTime = 0;
+byte switchState = SWITCH_NONE;
+bool switchPressed = false;
+
 void setup() {
   Serial.begin(9600);
 
-  initServo();
-
   pinMode(pushButtonPin, INPUT_PULLUP);
+  pushButton.attach(pushButtonPin);
+
   pinMode(auxInPin, INPUT_PULLUP);
 
   pinMode(USBBusPowerPin, INPUT);
@@ -92,20 +109,49 @@ void setup() {
 
   pinMode(audioPowerPin, OUTPUT);
   pinMode(auxPowerPin, OUTPUT);
+  pinMode(computerPowerPin, OUTPUT);
 
   pinMode(ledPin, OUTPUT);
   pinMode(ledSwPin, OUTPUT);
+
+  pinMode(tip120Pin, OUTPUT);
 
   transitionTo(STATE_STANDBY);
 }
 
 void loop() {
+  readSwitch();
+  readMIDI();
   doStateMachine();
   doLEDStateMachine();
 }
 
+void readSwitch() {
+  pushButton.update();
+  if (pushButton.fell()) {
+    switchPressed = true;
+    switchPressTime = millis();
+  } else if (pushButton.rose()) {
+    if (switchPressed) {
+      if ((millis() - switchPressTime) > switchHoldTime) {
+        //Long press
+        switchState = SWITCH_PRESS_LONG;
+      } else {
+        //Short press
+        switchState = SWITCH_PRESS_SHORT;
+      }
+      switchPressed = false;
+    }
+  }
+}
+
 //The Main State Machine
 void doStateMachine() {
+  if (switchState == SWITCH_PRESS_LONG) {
+    switchState = SWITCH_NONE;
+    transitionTo(STATE_STANDBY);
+  }
+
   switch (state) {
     case STATE_STANDBY:
       {
@@ -113,20 +159,18 @@ void doStateMachine() {
           Serial.print("Standby\n");
 
           transitionLEDState(STATE_LED_ON);
+          switchOffComputerPower();
           switchOffAudio();
-          switchOffAux();
           audioEngineState = STATE_AUDIO_OFF;
+          switchState = SWITCH_NONE;
 
           justTransitioned = false;
         }
 
-        if (digitalRead(switchingPowerPin) == LOW) {
-          Serial.print("Switching Power ON\n");
-
-          switchOnAux();
-          delay(30000);
-          switchOnMac();
-
+        if (switchState == SWITCH_PRESS_SHORT) {
+          Serial.print("Button pressed\n");
+          switchState = SWITCH_NONE;
+          switchOnComputerPower();
           transitionTo(STATE_COMPUTER_STARTING);
         }
         break;
@@ -158,8 +202,6 @@ void doStateMachine() {
           justTransitioned = false;
         }
 
-        readMIDI();
-
         if (audioEngineState == STATE_AUDIO_ON) {
           switchOnAudio();
           transitionTo(STATE_RUNNING);
@@ -177,12 +219,12 @@ void doStateMachine() {
           justTransitioned = false;
         }
 
-        if (digitalRead(switchingPowerPin) == HIGH) {
+        if (switchState == SWITCH_PRESS_SHORT) {
           Serial.print("Switching Power OFF\n");
 
           switchOffAudio();
-          delay(10000);
-          switchOffMac();
+          delay(2000);
+          sendShutdownMidi();
 
           transitionTo(STATE_COMPUTER_STOPPRING);
         }
@@ -289,29 +331,32 @@ void updateLED(bool newLEDFlashState) {
 }
 
 void readMIDI() {
-  midiEventPacket_t rx = MidiUSB.read();
-  switch (rx.header) {
-    case 0:
-      break;  //No pending events
+  midiEventPacket_t rx;
+  do {
+    rx = MidiUSB.read();
+    switch (rx.header) {
+      case 0:
+        break;  //No pending events
 
-    case 0x9:
-      Serial.print("Note On\n");
-      onNoteOn(
-        rx.byte1 & 0xF,  //channel
-        rx.byte2,        //pitch
-        rx.byte3         //velocity
-      );
-      break;
+      case 0x9:
+        Serial.print("Note On\n");
+        onNoteOn(
+          rx.byte1 & 0xF,  //channel
+          rx.byte2,        //pitch
+          rx.byte3         //velocity
+        );
+        break;
 
-    case 0x8:
-      Serial.print("Note Off\n");
-      onNoteOff(
-        rx.byte1 & 0xF,  //channel
-        rx.byte2,        //pitch
-        rx.byte3         //velocity
-      );
-      break;
-  }
+      case 0x8:
+        Serial.print("Note Off\n");
+        onNoteOff(
+          rx.byte1 & 0xF,  //channel
+          rx.byte2,        //pitch
+          rx.byte3         //velocity
+        );
+        break;
+    }
+  } while (rx.header != 0);
 }
 
 void onNoteOn(byte channel, byte note, byte velocity) {
@@ -343,11 +388,17 @@ void sendProgramChange(byte channel, byte program) {
   MidiUSB.flush();
 }
 
+void sendShutdownMidi() {
+  sendProgramChange(midiChannel, midiShutdownPC);
+}
+
 void switchOnAudio() {
+  digitalWrite(tip120Pin, HIGH);
   digitalWrite(audioPowerPin, HIGH);
 }
 
 void switchOffAudio() {
+  digitalWrite(tip120Pin, LOW);
   digitalWrite(audioPowerPin, LOW);
 }
 
@@ -359,23 +410,11 @@ void switchOffAux() {
   digitalWrite(auxPowerPin, LOW);
 }
 
-void switchOnMac() {
-  //Moves the servo to mechanically switch on Mac
-  servo.attach(servoPin);
-  servo.write(70);
-  delay(200);
-  servo.writeMicroseconds(1500);
-  delay(200);
-  servo.detach();
+void switchOnComputerPower() {
+  digitalWrite(computerPowerPin, HIGH);
 }
 
-void switchOffMac() {
-  sendProgramChange(midiChannel, midiShutdownPC);
+void switchOffComputerPower() {
+  digitalWrite(computerPowerPin, LOW);
 }
 
-void initServo() {
-  servo.attach(servoPin);
-  servo.writeMicroseconds(1500);
-  delay(200);
-  servo.detach();
-}

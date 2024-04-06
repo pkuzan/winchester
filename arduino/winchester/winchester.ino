@@ -171,6 +171,7 @@ void doStateMachine() {
           Serial.print("Button pressed\n");
           switchState = SWITCH_NONE;
           switchOnComputerPower();
+          transitionLEDState(STATE_LED_FLASH_SLOW);
           transitionTo(STATE_COMPUTER_STARTING);
         }
         break;
@@ -186,8 +187,6 @@ void doStateMachine() {
 
         if (digitalRead(USBBusPowerPin) == LOW) {
           Serial.print("USB Bus Power ON\n");
-
-          transitionLEDState(STATE_LED_FLASH_SLOW);
 
           transitionTo(STATE_HW_STARTING);
         }
@@ -393,11 +392,13 @@ void sendShutdownMidi() {
 }
 
 void switchOnAudio() {
+  digitalWrite(auxPowerPin, HIGH);
   digitalWrite(tip120Pin, HIGH);
   digitalWrite(audioPowerPin, HIGH);
 }
 
 void switchOffAudio() {
+  digitalWrite(auxPowerPin, LOW);
   digitalWrite(tip120Pin, LOW);
   digitalWrite(audioPowerPin, LOW);
 }
@@ -417,4 +418,3 @@ void switchOnComputerPower() {
 void switchOffComputerPower() {
   digitalWrite(computerPowerPin, LOW);
 }
-
